@@ -4,6 +4,8 @@
 #include <iostream>
 #include <cassert>
 
+
+
 class Task
 {
 public:
@@ -18,29 +20,37 @@ public:
 
         struct final_awaitable//final_suspend返回的awaiter的作用是让子协程结束后直接跳转到父协程继续执行
         {
-            std::coroutine_handle<_promise_type> _father_handle;//这个应当是结束的协程自身还是其父协程呢？
+            // std::coroutine_handle<_promise_type> _father_handle;//这个应当是结束的协程自身还是其父协程呢？
             //回应：应当传父亲的句柄，尽管可能为空
+            //但是现在不需要了
             bool await_ready()noexcept
             {
                 //所以永远先挂起？
                 return false;//留住这个协程帧，指不定还有用
             }
-            //如果没有父亲，
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<> self/*
-                这个await发生在子协程内部的结束之时，所以拿到的是这个协程的句柄，现在，父子句柄都有了*/
-            )noexcept
-            {
-                //如果执行这个函数要处理有没有父亲，注意，没有父亲的话不能直接销毁，等着Task先把值取出来
-                //等着Task析构再destroy
-                if(_father_handle)//父句柄是存在的
-                {
-                    //转移前先重设_in_active_handle,但这
-                    return _father_handle;//对称转移到父协程并resume他
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<_promise_type> self) noexcept {
+                auto &father_handle=self.promise()._parent;
+                if (father_handle) {
+                    // auto* father = _father_handle.promise()._owner;
+                    // // 回退直接父 Task
+                    // if (father)
+                    //     father->_in_active_handle = _father_handle;
+                    // // 再向上回退所有祖先
+                    // auto ancestor = _father_handle.promise()._parent;
+                    // while (ancestor) {
+                    //     auto* anc_task = ancestor.promise()._owner;
+                    //     if (anc_task)
+                    //         anc_task->_in_active_handle = _father_handle;
+                    //     ancestor = ancestor.promise()._parent;
+                    // }
+                    auto *top_task_ptr=self.promise()._owner;
+                    /*self是正在结束中的子协程，它有顶层task的指针*/
+                    top_task_ptr->_in_active_handle=father_handle;//转移活动协程
+                    return father_handle;//不逗留，对称转移立刻resume父协程
                 }
-                return std::noop_coroutine();//那就是挂起当前协程咯，总归需要一个人来destroy
+                return std::noop_coroutine();
             }
             void await_resume()noexcept{}//都final_waiter了怎么还会resume呢
-
         };
         ~_promise_type()
         {
@@ -51,7 +61,7 @@ public:
         //2.不是顶层协程，返回父
         final_awaitable final_suspend()noexcept
         {
-            return {_parent};
+            return {};
         }
 
 
@@ -65,6 +75,7 @@ public:
         std::coroutine_handle<_promise_type> _parent{nullptr};
         Task *_owner;//谁拥有着这个协程帧？
         //还是说并不是拥有语义，而是：谁是整个“调用栈”的顶层句柄
+        //就是顶层句柄，这样能把回退的复杂度将为O(1)
         std::optional<int> _value{std::nullopt};
     };
 
@@ -73,12 +84,26 @@ public:
     Task(std::coroutine_handle<promise_type> handle):_handle(handle)
     {
         _in_active_handle=handle;
+        _handle.promise()._owner=this;//注意，刚创建时是这样的
+    }
+    void coro_repoint()noexcept
+    {
+        if(!_handle) return;
+        //先修改直属协程
         _handle.promise()._owner=this;
+        // 然后从底往上依次纠正
+        auto coro_handle=_in_active_handle;
+        while(coro_handle && coro_handle.promise()._parent)//这还是个子协程，有父协程
+        {
+            coro_handle.promise()._owner=this;
+            coro_handle=coro_handle.promise()._parent;//向上迭代一层
+        }//循环不会触碰到直属协程
     }
     Task(Task&&other)noexcept:_handle(other._handle),_in_active_handle(other._in_active_handle)
     {
         other._handle=nullptr;
         other._in_active_handle=nullptr;
+        coro_repoint();
     }
     Task(const Task&)=delete;
     Task& operator=(Task&& other)noexcept
@@ -92,12 +117,17 @@ public:
         _handle=other._handle;
         _in_active_handle=other._in_active_handle;
         other._handle=other._in_active_handle=nullptr;
+        coro_repoint();
         return *this;
     }
     std::optional<int> get_return()noexcept
     {
         if(_in_active_handle)
-            return _in_active_handle.promise()._value;
+        {
+            auto result=_in_active_handle.promise()._value;
+            _in_active_handle.promise()._value=std::nullopt;
+            return result;
+        }
         return std::nullopt;
     }
     void resume()noexcept
@@ -122,15 +152,29 @@ public:
         //那要是没有子协程了呢？
         return false;//先写个false看看
     }
-    void/*将父协程挂起，继续向上传递挂起*/ await_suspend(std::coroutine_handle<promise_type> _father)noexcept
-    {
-        auto father_handle=_father.promise()._owner;/*获得其持有者的指针*/
-        father_handle->_in_active_handle=this->_in_active_handle;
-        _handle.promise()._parent=_father;
+    void await_suspend(std::coroutine_handle<promise_type> _father) noexcept {
+        // // 先更新直接父 Task
+        // auto* father_task = _father.promise()._owner;
+        // if (father_task)
+        //     father_task->_in_active_handle = this->_in_active_handle;
+
+        // // 沿 _parent 链向上更新所有祖先 Task 的 _in_active_handle
+        // auto ancestor_handle = _father.promise()._parent;
+        // while (ancestor_handle) {
+        //     auto* ancestor_task = ancestor_handle.promise()._owner;
+        //     if (ancestor_task)
+        //         ancestor_task->_in_active_handle = this->_in_active_handle;
+        //     ancestor_handle = ancestor_handle.promise()._parent;
+        // }
+        // 设置当前子协程的 _parent
+        _handle.promise()._parent = _father;
+        auto* top_Task_ptr=_handle.promise()._owner=_father.promise()._owner;//全部统一指向最顶层句柄
+        //并且通过_owner赋值链一直传递到底部
+        top_Task_ptr->_in_active_handle=_handle;//修改活跃协程为本协程
     }
     std::optional<int> await_resume()noexcept
     {
-        return _handle.promise()._value;
+        return _handle.promise()._value;//返回的是结束的子协程的co_return值
     }
 private:
     std::coroutine_handle<promise_type> _handle;//你只管理你亲儿子的命
@@ -143,24 +187,26 @@ Task inner()
     std::cout<<"inner one\n";
     co_await std::suspend_always();
     std::cout<<"inner two\n";
-    co_return 0;
-}
-
-Task coroutine()
-{
-    std::cout<<"part one\n";
-    co_await std::suspend_always();
-    std::cout<<"part two\n";
-    co_await inner();
-    std::cout<<"part three\n";
+    co_yield 3;
+    std::cout<<"inner three\n";
     co_return 10;
 }
+Task top()
+{
+    std::cout<<"top one\n";
+    std::optional<int> value=co_await inner();
+    std::cout<<"top two\n";
+    co_await std::suspend_always();
+    std::cout<<"top three\n";
+    co_return value.value_or(-1);
+}
 int main() {
-    auto task=coroutine();
-    std::cout<<"main one\n";
-
+    auto task=top();
+    std::cout<<"main one "<<task.get_return().value_or(-1)<<'\n';
     task.resume();
-    std::cout<<"main two\n";
+    std::cout<<"main two "<<task.get_return().value_or(-1)<<'\n';
     task.resume();
-    std::cout<<"main three\n";
+    std::cout<<"main three "<<task.get_return().value_or(-1)<<'\n';
+    task.resume();
+    std::cout<<"main four "<<task.get_return().value_or(-1)<<'\n';
 }
