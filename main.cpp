@@ -39,6 +39,8 @@ public:
     Task(const Task&)=delete;
     Task& operator=(Task&& other)noexcept
     {
+        if(&other==this)
+            return *this;
         //先要确保原先的协程不泄漏
         if(_handle)
         {
@@ -255,6 +257,8 @@ public:
     Task(const Task&)=delete;
     Task& operator=(Task&& other)noexcept
     {
+        if(&other==this)
+            return *this;
         if(_handle)
         {
             _handle.destroy();
@@ -383,32 +387,37 @@ Task<void>::Task(std::coroutine_handle<promise_type> handle)noexcept:_handle(han
     _handle.promise()._owner=this;
     _in_active_promise_ptr=&handle.promise();
 }
-
+//想要让用户代码优雅，这行是关键
 using async=Task<void>;
 
 #include <iostream>
+#include<deque>
 
-async inner()
+async function()
 {
-    std::cout<<"inner one\n";
+    std::cout<<"one\n";
     co_await std::suspend_always();
-    std::cout<<"inner two\n";
-    co_return;
-}
-Task<int> top()
-{
-    std::cout<<"top one\n";
-    co_await inner();
-    std::cout<<"top two\n";
+    std::cout<<"two\n";
     co_await std::suspend_always();
-    std::cout<<"top three\n";
-    co_return 10;
+    std::cout<<"three\n";
+    co_await std::suspend_always();
+    std::cout<<"four\n";
 }
+
 int main() {
-    auto task=top();
-    task.resume();
-    std::cout<<"main two "<<task.get_return().value_or(-1)<<'\n';
-    task.resume();
-    std::cout<<"main three "<<task.get_return().value_or(-1)<<'\n';
+    auto task=function(); 
 
+    std::cout<<"main one\n";
+    std::cin.get();
+    task.resume();
+
+    std::cout<<"main two\n";
+    std::cin.get();
+    task.resume();
+
+    std::cout<<"main three\n";
+    std::cin.get();
+    task.resume();
+    
+    std::cout<<"main four\n";
 }
