@@ -3,10 +3,10 @@
 #include"async.hpp"
 #include<deque>
 #include<mutex>
+#include<condition_variable>
 #include<thread>
 #include<functional>
 
-//暂时用有锁，以后再改无锁
 template<typename T>
 class Pipe
 {
@@ -14,8 +14,10 @@ public:
     Pipe():_mutex{},_queue{},_co_va{}{}
     void commit(T &&value)
     {
-        std::unique_lock<std::mutex> guard{_mutex};
-        _queue.push_back(std::move(value));
+        {
+            std::unique_lock<std::mutex> guard{_mutex};
+            _queue.push_back(std::move(value));
+        }
         _co_va.notify_one();
     }
     std::optional<T> get_one_nonblock()
@@ -27,12 +29,23 @@ public:
         _queue.pop_front();
         return return_object;
     }
-    T wait_one_block()
+    T wait_one_blocking()
     {
         std::unique_lock<std::mutex> guard{_mutex};
         if(_queue.empty())
         {
             _co_va.wait(guard,[this](){return !_queue.empty();});
+        }
+        T return_object=std::move(_queue.front());
+        _queue.pop_front();
+        return return_object;
+    }
+    T wait_one_block(std::stop_token &stop_token)
+    {
+        std::unique_lock<std::mutex> guard{_mutex};
+        if(_queue.empty())
+        {
+            _co_va.wait(guard,[this,&stop_token](){return !_queue.empty() || stop_token.stop_requested();});
         }
         T return_object=std::move(_queue.front());
         _queue.pop_front();
@@ -146,9 +159,9 @@ public:
                 new(_loops+index)Thread_pipe<Coroutine_with_context<T>>(std::forward<F>(thread_func));
             }catch(...)
             {
-                while(--_index>=0)
+                for(int i=0;i<index;++i)
                 {
-                    (_loops+index)->~Thread_pipe<Coroutine_with_context<T>>();
+                    (_loops+i)->~Thread_pipe<Coroutine_with_context<T>>();
                 }
                 return;
             }
@@ -199,9 +212,9 @@ public:
                 new(_loops+index)Thread_pipe<Coroutine_with_context<void>>(std::forward<F>(thread_func));
             }catch(...)
             {
-                whiel(--index>=0)
+                for(int i=0;i<index;++i)
                 {
-                    (_loops+index)->~Thread_pipe<Coroutine_with_context<void>>();
+                    (_loops+i)->~Thread_pipe<Coroutine_with_context<void>>();
                 }
                 return;
             }
