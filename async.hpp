@@ -109,7 +109,7 @@ public:
     template<typename U> friend class _promise_type; 
     using promise_type=_promise_type<T>;
     Task(std::coroutine_handle<promise_type>)noexcept;
-    Task(Task&&other)noexcept:_handle(other._handle),_base_task(other)
+    Task(Task&&other)noexcept:_base_task(other),_handle(other._handle)
     {
         other._handle=nullptr;
         other._in_active_handle=nullptr;
@@ -156,7 +156,7 @@ public:
     //因为发生异常时还是会调用final_suspend,所以如果子协程异常结束，按照设计的final_awaitable,还是会恢复父协程
     std::optional<T> await_resume()const;
 private:
-    std::coroutine_handle<promise_type> _handle;//所有权
+    std::coroutine_handle<promise_type> _handle{nullptr};//所有权
 };
 
 template<typename T>
@@ -299,7 +299,7 @@ public:
     template<typename U> friend class _promise_type; 
     using promise_type=_promise_type<void>;
     Task(std::coroutine_handle<promise_type>)noexcept;
-    Task(Task&&other)noexcept:_handle(other._handle),_base_task(other)
+    Task(Task&&other)noexcept:_base_task(other),_handle(other._handle)
     {
         other._handle=nullptr;
         other._in_active_handle=nullptr;
@@ -343,7 +343,7 @@ public:
 
     void await_resume()const;
 private:
-    std::coroutine_handle<promise_type> _handle;
+    std::coroutine_handle<promise_type> _handle{nullptr};
 };
 template<>
 struct _promise_type<void>:public _base_promise
@@ -414,7 +414,7 @@ std::optional<U> _base_task::get_value()const noexcept
             _in_active_handle.address()
         );
         if(real_type_handle.promise()._value)
-            return *reinterpret_cast<std::optional<U>*>(real_type_handle.promise()._value);
+            return std::move(*reinterpret_cast<std::optional<U>*>(real_type_handle.promise()._value));
     }
     return std::nullopt;
 }
@@ -473,24 +473,28 @@ private:
 
 //对称转移工具，co_await Task属于非对称转移
 //_switch_to最好配合start包装器使用，因为_switch_to会假设原协程顶Task的类型和目标Task类型一样并static_cast
-//如果顶部Task类型不是Task<void>
+//如果顶部Task类型不是Task<void>，会导致UB
 //这是类型擦除的_base_task本身的限制，目前并没有更好的解决方案，
 //本库的目的是简洁高效和灵活，所以不会引入RTTI和虚函数等机制，类型安全部分交给程序员保证
 bool Do_nothing(Task<void>&,std::coroutine_handle<>)noexcept{return true;}
-bool Delete_origin(Task<void>&,std::coroutine_handle<>)noexcept{return false;}\
+bool Delete_origin(Task<void>&,std::coroutine_handle<>)noexcept{return false;}
 
 template<std::invocable<Task<void>&,std::coroutine_handle<>> Callable>
 class _swap_switch_to
 {
-    friend _swap_switch_to<Callable> swap_switch_to<Callable>(Task<void>&,int,Callable&&)noexcept;
+    template<std::invocable<Task<void>&,std::coroutine_handle<>> F> friend
+    _swap_switch_to<F> swap_switch_to(Task<void> &des,F&&hook)noexcept;
+    template<std::invocable<Task<void>&,std::coroutine_handle<>> F> friend
+    _swap_switch_to<F> swap_switch_to(Task<void> &&des,F&&hook)noexcept;
 
-    _swap_switch_to(Task<void> *des,int code,Callable&&hook)noexcept:
-        _destination{des},_code{code},if_success{false},_hook{std::forward<Callable>(hook)}{}
+    template<typename F>
+    _swap_switch_to(Task<void> *des,F&&hook)noexcept:
+        _destination{des},if_success{false},_hook{std::forward<F>(hook)}{}
 public:
     _swap_switch_to(const _swap_switch_to&)=delete;
     _swap_switch_to& operator=(const _swap_switch_to&)=delete;
     _swap_switch_to(_swap_switch_to&&other)noexcept:
-        _destination{other._destination},_code{other._code},if_success{false},_hook{std::move(other._hook)}
+        _destination{other._destination},if_success{false},_hook{std::move(other._hook)}
     {other._destination=nullptr;}
     _swap_switch_to& operator=(_swap_switch_to&&)=delete;
 
@@ -527,9 +531,6 @@ public:
             _destination->_in_active_promise_ptr=nullptr;
             _handle.destroy();
             //虽然销毁帧，并不会影响await_suspend的执行，因为接下来不会再访问原协程的任何东西了
-        }else
-        {
-            _destination->_in_active_promise_ptr->_state_code=_code;
         }
         origin_task->_in_active_promise_ptr->_state_code=1;
         return origin_task->_in_active_handle;//其实现在_origin_task已经指向整个destination桟了
@@ -540,14 +541,18 @@ public:
     bool await_resume()noexcept{return if_success;}
 private:
     Task<void> *_destination;
-    int _code;
     bool if_success;
     //给用户一个钩子可以操作切换后的原协程
     std::decay_t<Callable> _hook;
     //返回false意味着“抛弃”原协程调用栈，await_suspend内部会将原协程销毁，目标协程的原主Task会被置空；
 };
 template<std::invocable<Task<void>&,std::coroutine_handle<>> Callable>
-_swap_switch_to<Callable> swap_switch_to(Task<void> &des,int code=1,Callable&&hook=Do_nothing)noexcept
+_swap_switch_to<Callable> swap_switch_to(Task<void> &des,Callable&&hook)noexcept
 {
-    return {&des,code,std::forward<Callable>(hook)};
+    return {&des,std::forward<Callable>(hook)};
+}
+template<std::invocable<Task<void>&,std::coroutine_handle<>> Callable>
+_swap_switch_to<Callable> swap_switch_to(Task<void> &&des,Callable&&hook)noexcept
+{
+    return {&des,std::forward<Callable>(hook)};
 }
