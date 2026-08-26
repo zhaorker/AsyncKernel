@@ -7,13 +7,18 @@
 #include<concepts>
 #include<cstdint>
 #include<cassert>
+#include<memory>
+#include<atomic>
 #ifndef NDEBUG
     #include<typeinfo>
 #endif
 
 struct _base_promise;
+struct _base_task;
 template<typename T>
 struct _promise_type;//这行，非常关键，不然编译报大量错
+template<typename T>
+class Task;
 
 enum class Promise_error{
     NO_value,Invalid_task
@@ -30,7 +35,6 @@ struct State_code_package
     }
     std::int64_t user_msg;
     bool is_kernel;
-};
 /*
 目前使用的kernel态状态码有：
 -1：代表调用链的彻底退出，不会保留协程帧
@@ -41,37 +45,168 @@ struct State_code_package
 库作者可以按需使用kernel态状态码，但不要与-1,0,1,2,3重复
 普通用户一定要使用用户态状态码，可以安全地把任意数据向外传递，甚至是指针
 */
+};
+static constexpr inline State_code_package Kernel_State[]{{-1,true},{0,true},{1,true},{2,true},{3,true}};
 
-//触发子协程结束时，父协程状态一定是2,自身则一定是1,所以需要设置父协程状态为运行时（1）
+
+
 struct final_awaitable//final_suspend返回的awaiter的作用是让子协程结束后直接跳转到父协程继续执行
 {
     bool await_ready()const noexcept{return false;}
     //作为即将结束的类型T协程，它收到的self就是自身T类型的句柄
     template<typename T>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<_promise_type<T>>)noexcept;
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<_promise_type<T>>self)noexcept
+    {
+        auto &father_handle=self.promise()._parent_handle;
+        if (father_handle) {
+            auto *top_task_ptr=self.promise()._owner;
+            /*self是正在结束中的子协程，它有顶层task的指针*/
+            top_task_ptr->_in_active_handle=father_handle;//转移活动协程指向
+            top_task_ptr->_in_active_promise_ptr=self.promise()._parent_promise_ptr;
+
+            self.promise()._parent_promise_ptr->_owner=self.promise()._owner;//校准父协程的_owner,因为自己一定是准的（Task移动coro_repoint）
+
+            self.promise()._parent_promise_ptr->_state_code={1,true};
+            return father_handle;//不逗留，对称转移立刻resume父协程
+        }
+        self.promise()._state_code={0,true};
+        return std::noop_coroutine();
+    }
     void await_resume()const noexcept{}//根本不会被调用
 };
 
-struct _base_task
+struct _base_promise
 {
+
+    std::coroutine_handle<> _parent_handle{nullptr};
+    _base_promise *_parent_promise_ptr{nullptr};
+
+    _base_task* _owner{nullptr};
+
+    State_code_package _state_code{1,true};
+
+    std::exception_ptr _exp{};
     #ifndef NDEBUG
-        const std::type_info *type;
+    const std::type_info *type;
     #endif
-    _base_task()noexcept{
+
+    std::suspend_always initial_suspend()const noexcept{ return {}; }
+    final_awaitable final_suspend()const noexcept{return {};}
+
+    void unhandled_exception()noexcept
+    {
+        _exp=std::current_exception();
+    }
+    //用于实现结构化并发的观察令牌机制
+    // std::shared_ptr<std::atomic_flag> _complete_flag{nullptr};
+    _base_promise()noexcept
+    {
         #ifndef NDEBUG
-        type=&typeid(_base_task);
+        type=&typeid(_base_promise);
         #endif
     }
+};
+struct _base_task
+{
+    //所有权关系
+    std::coroutine_handle<> _handle{nullptr};
+    _base_promise *_promise_ptr{nullptr};
+    //观察非拥有
     std::coroutine_handle<> _in_active_handle{nullptr};
     _base_promise *_in_active_promise_ptr{nullptr};//两者共同合作处理一个协程帧
     //要使用_in_active_handle激活底部协程
     //要使用_in_active_handle修改_owner(在Task被移动时)
-    template<typename T>
-    std::expected<T,Promise_error> get_value()noexcept;
+    #ifndef NDEBUG
+        const std::type_info *type;
+    #endif
+protected:
+    _base_task()noexcept
+    {
+        #ifndef NDEBUG
+        type=&typeid(_base_task);
+        #endif
+    }
+    _base_task(std::coroutine_handle<>handle,_base_promise *promise_ptr)noexcept:
+        _handle{handle},_promise_ptr{promise_ptr},
+        _in_active_handle{handle},_in_active_promise_ptr{promise_ptr}
+    {
+        #ifndef NDEBUG
+        type=&typeid(_base_task);
+        #endif
+        promise_ptr->_owner=this;
+    }
+    _base_task(const _base_task&)=delete;
+    _base_task& operator=(const _base_task&)=delete;
+    _base_task(_base_task&&other)noexcept:_base_task{other._handle,other._promise_ptr}
+    {
+        other._handle=
+        other._in_active_handle=nullptr;
+        other._promise_ptr=
+        other._in_active_promise_ptr=nullptr;
+        coro_repoint();
+    }
+    _base_task& operator=(_base_task&&other)noexcept
+    {
+        if(&other==this)
+            return *this;
+        std::coroutine_handle<> handle=_handle;
 
-    void coro_repoint()noexcept;
+        _handle=other._handle;
+        _in_active_handle=other._in_active_handle;
+        _promise_ptr=other._promise_ptr;
+        _in_active_promise_ptr=other._in_active_promise_ptr;
 
-    State_code_package get_state()const noexcept;
+        other._handle=
+        other._in_active_handle=nullptr;
+        other._promise_ptr=
+        other._in_active_promise_ptr=nullptr;
+
+        coro_repoint();
+
+        if(handle)
+            handle.destroy();
+        return *this;
+    }
+    void coro_repoint()noexcept
+    {
+        if(_in_active_promise_ptr)
+            _in_active_promise_ptr->_owner=this;
+    }
+public:
+    ~_base_task()
+    {
+        if(!_handle)
+            return;
+        std::coroutine_handle<> handle=_handle;
+        _handle=
+        _in_active_handle=nullptr;
+        _promise_ptr=
+        _in_active_promise_ptr=nullptr;
+        handle.destroy();
+    }
+    template<typename U>
+    std::expected<U,Promise_error> get_value()noexcept
+    {
+        if( _in_active_handle)
+        {
+            assert(_in_active_promise_ptr->type==&typeid(_promise_type<U>));
+            auto real_type_handle=std::coroutine_handle<_promise_type<U>>::from_address(
+                _in_active_handle.address()
+            );
+            if(!real_type_handle.promise()._value._has_value)
+                return std::unexpected(Promise_error::NO_value);
+            real_type_handle.promise()._value._has_value=false;
+            return std::move(real_type_handle.promise()._value._value);
+        }
+        return std::unexpected(Promise_error::Invalid_task);
+    }
+
+    const State_code_package& get_state()const noexcept
+    {
+        if(!_in_active_handle || !_in_active_promise_ptr)
+            return Kernel_State[0];//协程已销毁肯定是发生了co_exit,因为正常结束是不会立刻销毁协程帧的
+        return _in_active_promise_ptr->_state_code;
+    }
     //代表可reume的状态
     bool valid()const noexcept
     {
@@ -88,45 +223,52 @@ struct _base_task
             return _in_active_handle.done();
         return false;
     }
-    //awaitable
+
+    bool resume()
+    {
+        if(!_in_active_handle || _in_active_handle.done())
+            return false;
+        _in_active_promise_ptr->_state_code={1,true};
+        _in_active_handle.resume();
+        if(_in_active_promise_ptr->_exp)
+            std::rethrow_exception(_in_active_promise_ptr->_exp);
+        if(_in_active_promise_ptr->_state_code==State_code_package{-1,true})
+        {
+            auto handle=_handle;
+            _in_active_handle=_handle=nullptr;
+            _in_active_promise_ptr=nullptr;
+            handle.destroy();
+        }
+        return true;
+    }
+    // std::weak_ptr<std::atomic_flag> get_token()const noexcept;
+
+    //接下来是awaitable成员
     //永远先触发父协程挂起，然后建立父子联系然后恢复子协程执行
     bool await_ready()const noexcept{return false;}
-};
 
-struct _base_promise
-{
-
-    std::coroutine_handle<> _parent_handle{nullptr};
-    _base_promise *_parent_promise_ptr{nullptr};
-
-    _base_task* _owner{nullptr};
-
-    State_code_package _state_code{1,true};
-
-    std::suspend_always initial_suspend()const noexcept{ return {}; }
-    final_awaitable final_suspend()const noexcept{return {};}
-
-    std::exception_ptr _exp{};
-    void unhandled_exception()noexcept
+    template<typename T>
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<_promise_type<T>> _father)noexcept
     {
-        _exp=std::current_exception();
+        if(!valid())//当前task持有的不是一个有效的协程桟（-1或者已经结束）
+            return std::noop_coroutine();
+
+        _promise_ptr->_parent_handle = _father;
+        _promise_ptr->_parent_promise_ptr = &_father.promise();
+
+        //只让底部对准_owner,对称转移的时候才纠正父协程的_owner
+        auto* top_Task_ptr=_in_active_promise_ptr->_owner=_father.promise()._owner;
+        
+        //并且通过_owner赋值链一直传递到底部
+        top_Task_ptr->_in_active_handle=_in_active_handle;//修改活跃协程为本桟的活跃协程
+        top_Task_ptr->_in_active_promise_ptr=_in_active_promise_ptr;
+
+        _father.promise()._state_code={2,true};
+        _in_active_promise_ptr->_state_code={1,true};
+        return _in_active_handle;
     }
-    #ifndef NDEBUG
-    const std::type_info *type;
-    #endif
-    _base_promise()noexcept
-    {
-        #ifndef NDEBUG
-        type=&typeid(_base_promise);
-        #endif
-    }
+    //await_resume因为要返回expected,没法泛型化了
 };
-State_code_package _base_task::get_state()const noexcept
-{
-    if(!_in_active_handle || !_in_active_promise_ptr)
-        return {-1,true};//协程已销毁肯定是发生了co_exit,因为正常结束是不会立刻销毁协程帧的
-    return _in_active_promise_ptr->_state_code;
-}
 
 /*
 在coroutine内部使用co_await suspend_state_code{value};挂起当前协程并设置状态码
@@ -139,74 +281,16 @@ public:
     bool await_ready()const noexcept{return false;}
 
     template<typename T>
-    void await_suspend(std::coroutine_handle<_promise_type<T>>)const noexcept;
+    void await_suspend(std::coroutine_handle<_promise_type<T>>handle)const noexcept
+    {
+        handle.promise()._state_code=_value;
+    }
 
     void await_resume()const noexcept{}
 };
 static constexpr inline suspend_state_code co_exit{-1,true};
 
 
-template<typename T>
-class Task:public _base_task
-{
-    template<std::invocable<Task<void>&,std::coroutine_handle<>>>friend class _swap_switch_to;
-public:
-    Task()noexcept:_base_task{}
-    {
-        #ifndef NDEBUG
-        type=&typeid(Task);
-        #endif
-    }
-    template<typename U> friend class _promise_type; 
-    using promise_type=_promise_type<T>;
-    Task(std::coroutine_handle<promise_type>)noexcept;
-    Task(Task&&other)noexcept:_base_task(other),_handle(other._handle)
-    {
-        other._handle=nullptr;
-        other._in_active_handle=nullptr;
-        other._in_active_promise_ptr=nullptr;
-        coro_repoint();
-    }
-    Task(const Task&)=delete;
-    Task& operator=(Task&& other)noexcept
-    {
-        if(&other==this)
-            return *this;
-        auto handle=_handle;
-
-        _handle=other._handle;
-        _in_active_handle=other._in_active_handle;
-        _in_active_promise_ptr=other._in_active_promise_ptr;
-
-        other._handle=nullptr;
-        other._in_active_handle=nullptr;
-        other._in_active_promise_ptr=nullptr;
-
-        coro_repoint();
-        if(handle)
-            handle.destroy();
-        return *this;
-    }
-    Task& operator=(const Task&)=delete;
-
-    bool resume();
-    ~Task()
-    {
-        if(_handle)
-        {
-            _handle.destroy();
-        }
-    }
-
-    template<typename Father_T>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<_promise_type<Father_T>> _father) noexcept;
-
-    //子协程里的异常将通过这个抛进父协程空间
-    //因为发生异常时还是会调用final_suspend,所以如果子协程异常结束，按照设计的final_awaitable,还是会恢复父协程
-    std::expected<T,Promise_error> await_resume()const;
-private:
-    std::coroutine_handle<promise_type> _handle{nullptr};//所有权
-};
 
 template<typename T>
 struct _promise_type:public _base_promise
@@ -263,128 +347,78 @@ struct _promise_type:public _base_promise
     }
 };
 
-template<typename T>
-template<typename Father_T>
-std::coroutine_handle<> Task<T>::await_suspend(std::coroutine_handle<_promise_type<Father_T>> _father) noexcept {
-    if(!valid())//当前task持有的不是一个有效的协程桟（-1或者已经结束）
-        return std::noop_coroutine();
 
-    _handle.promise()._parent_handle = _father;
-    _handle.promise()._parent_promise_ptr = &_father.promise();
-
-    //只让底部对准_owner,对称转移的时候才纠正父协程的_owner
-    auto* top_Task_ptr=_in_active_promise_ptr->_owner=_father.promise()._owner;
-    
-    //并且通过_owner赋值链一直传递到底部
-    top_Task_ptr->_in_active_handle=_in_active_handle;//修改活跃协程为本桟的活跃协程
-    top_Task_ptr->_in_active_promise_ptr=_in_active_promise_ptr;
-
-    _father.promise()._state_code={2,true};
-    _in_active_promise_ptr->_state_code={1,true};
-    return _in_active_handle;
-}
 template<typename T>
-std::expected<T,Promise_error> Task<T>::await_resume()const
-{
-    if(!_handle)
-        return std::unexpected(Promise_error::Invalid_task);
-    if(_handle.promise()._exp)
-        std::rethrow_exception(_handle.promise()._exp);
-    if(!_handle.promise()._value._has_value)
-        return std::unexpected(Promise_error::NO_value);
-    return std::move(_handle.promise()._value._value);
-}
-template<typename T>
-bool Task<T>::resume()
-{
-    if(!_in_active_handle || _in_active_handle.done())//当done为真，只有可能是对直属协程的,那就意味着整个桟结束了
-        return false;
-    _in_active_promise_ptr->_state_code={1,true};//正在运行的协程状态必须是1
-    _in_active_handle.resume();
-    if(_in_active_promise_ptr->_exp)
-        std::rethrow_exception(_in_active_promise_ptr->_exp);
-    if(_in_active_promise_ptr->_state_code==State_code_package{-1,true})//内部使用了co_await co_exit;此时应当直接析构整个协程桟
-    {
-        auto handle=_handle;
-        _in_active_handle=_handle=nullptr;
-        _in_active_promise_ptr=nullptr;
-        handle.destroy();
-    }
-    return true;
-}
-template<typename T>
-Task<T>::Task(std::coroutine_handle<promise_type> handle)noexcept:_base_task{},_handle{handle}
-{
-    _in_active_handle=handle;
-    _handle.promise()._owner=this;
-    _in_active_promise_ptr=&handle.promise();//指向实在的promise,用基类指针
-    #ifndef NDEBUG
-    type=&typeid(Task);
-    #endif
-}
-
-/*=========================然后做一下void特化=========================*/
-template<>
-struct _promise_type<void>;
-template<>
-class Task<void>:public _base_task
+class Task:public _base_task
 {
     template<std::invocable<Task<void>&,std::coroutine_handle<>>>friend class _swap_switch_to;
+    template<typename U> friend class _promise_type; 
 public:
+    using promise_type=_promise_type<T>;
     Task()noexcept:_base_task{}
     {
         #ifndef NDEBUG
         type=&typeid(Task);
         #endif
     }
-    template<typename U> friend class _promise_type; 
-    using promise_type=_promise_type<void>;
-    Task(std::coroutine_handle<promise_type>)noexcept;
-    Task(Task&&other)noexcept:_base_task(other),_handle(other._handle)
+    Task(std::coroutine_handle<promise_type> handle)noexcept:_base_task{handle,&handle.promise()}
     {
-        other._handle=nullptr;
-        other._in_active_handle=nullptr;
-        other._in_active_promise_ptr=nullptr;
-        coro_repoint();
+        #ifndef NDEBUG
+        type=&typeid(Task);
+        #endif
     }
+    Task(Task&&)noexcept=default;
     Task(const Task&)=delete;
-    Task& operator=(Task&& other)noexcept
-    {
-        if(&other==this)
-            return *this;
-
-        auto handle=_handle;
-
-        _handle=other._handle;
-        _in_active_handle=other._in_active_handle;
-        _in_active_promise_ptr=other._in_active_promise_ptr;
-
-        other._handle=nullptr;
-        other._in_active_handle=nullptr;
-        other._in_active_promise_ptr=nullptr;
-
-        if(handle)
-            handle.destroy();
-
-        coro_repoint();
-        return *this;
-    }
+    Task& operator=(Task&&)noexcept=default;
     Task& operator=(const Task&)=delete;
-    bool resume();
-    ~Task()
+    ~Task()=default;
+
+    //子协程里的异常将通过这个抛进父协程空间
+    //因为发生异常时还是会调用final_suspend,所以如果子协程异常结束，按照设计的final_awaitable,还是会恢复父协程
+    std::expected<T,Promise_error> await_resume()const
     {
-        if(_handle)
-        {
-            _handle.destroy();
-        }
+        if(!_promise_ptr)
+            return std::unexpected(Promise_error::Invalid_task);
+        if(_promise_ptr->_exp)
+            std::rethrow_exception(static_cast<_promise_type<T>*>(_promise_ptr)->_exp);
+        if(!static_cast<_promise_type<T>*>(_promise_ptr)->_value._has_value)
+            return std::unexpected(Promise_error::NO_value);
+        return std::move(static_cast<_promise_type<T>*>(_promise_ptr)->_value._value);
     }
 
-    template<typename Father_T>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<_promise_type<Father_T>> _father) noexcept;
+};
 
-    void await_resume()const;
-private:
-    std::coroutine_handle<promise_type> _handle{nullptr};
+/*=========================然后做一下void特化=========================*/
+template<>class Task<void>;
+template<>struct _promise_type<void>;
+template<>
+class Task<void>:public _base_task
+{
+    template<std::invocable<Task<void>&,std::coroutine_handle<>>>friend class _swap_switch_to;
+    template<typename U> friend class _promise_type;
+public:
+    using promise_type=_promise_type<void>;
+    Task()noexcept:_base_task{}
+    {
+        #ifndef NDEBUG
+        type=&typeid(Task);
+        #endif
+    }
+    Task(std::coroutine_handle<promise_type> handle)noexcept;
+    Task(Task&&other)noexcept=default;
+    Task(const Task&)=delete;
+    Task& operator=(Task&& other)noexcept=default;
+    Task& operator=(const Task&)=delete;
+    ~Task()=default;
+
+    bool await_resume()const
+    {
+        if(!_promise_ptr)
+            return false;
+        if(_promise_ptr->_exp)
+            std::rethrow_exception(_promise_ptr->_exp);
+        return true;
+    }
 };
 template<>
 struct _promise_type<void>:public _base_promise
@@ -403,95 +437,14 @@ struct _promise_type<void>:public _base_promise
 
     void return_void()const noexcept{}
 };
-template<typename Father_T>
-std::coroutine_handle<> Task<void>::await_suspend(std::coroutine_handle<_promise_type<Father_T>> _father) noexcept {
-    if(!valid())
-        return std::noop_coroutine();
-    _handle.promise()._parent_handle = _father;
-    _handle.promise()._parent_promise_ptr = &_father.promise();
-
-    auto* top_Task_ptr=_in_active_promise_ptr->_owner=_father.promise()._owner;
-    
-    top_Task_ptr->_in_active_handle=_in_active_handle;
-    top_Task_ptr->_in_active_promise_ptr=_in_active_promise_ptr;
-
-    _father.promise()._state_code={2,true};
-    _in_active_promise_ptr->_state_code={1,true};
-    return _in_active_handle;
-}
-bool Task<void>::resume()
+Task<void>::Task(std::coroutine_handle<promise_type> handle)noexcept:_base_task{handle,&handle.promise()}
 {
-    if(!_in_active_handle || _in_active_handle.done())
-        return false;
-    _in_active_promise_ptr->_state_code={1,true};
-    _in_active_handle.resume();
-    if(_in_active_promise_ptr->_exp)
-        std::rethrow_exception(_in_active_promise_ptr->_exp);
-    if(_in_active_promise_ptr->_state_code==State_code_package{-1,true})
-    {
-        auto handle=_handle;
-        _in_active_handle=_handle=nullptr;
-        _in_active_promise_ptr=nullptr;
-        handle.destroy();
-    }
-    return true;
-}
-Task<void>::Task(std::coroutine_handle<promise_type> handle)noexcept:_base_task{},_handle{handle}
-{
-    _in_active_handle=handle;
-    _handle.promise()._owner=this;
-    _in_active_promise_ptr=&handle.promise();
     #ifndef NDEBUG
     type=&typeid(Task);
     #endif
 }
-void Task<void>::await_resume()const
-{
-    if(!_handle)
-        return;
-    if(_handle.promise()._exp)
-        std::rethrow_exception(_handle.promise()._exp);
-}
-//_base_task的循环依赖让成员不得不在这里写实现
-inline void _base_task::coro_repoint()noexcept
-{
-    if(_in_active_promise_ptr)
-        _in_active_promise_ptr->_owner=this;
-}
-template<typename U>
-std::expected<U,Promise_error> _base_task::get_value()noexcept
-{
-    if( _in_active_handle)
-    {
-        assert(_in_active_promise_ptr->type==&typeid(_promise_type<U>));
-        auto real_type_handle=std::coroutine_handle<_promise_type<U>>::from_address(
-            _in_active_handle.address()
-        );
-        if(!real_type_handle.promise()._value._has_value)
-            return std::unexpected(Promise_error::NO_value);
-        real_type_handle.promise()._value._has_value=false;
-        return std::move(real_type_handle.promise()._value._value);
-    }
-    return std::unexpected(Promise_error::Invalid_task);
-}
-//补上最开始的final_awaitable实现，依赖promise_type具体成员
-template<typename T>
-std::coroutine_handle<> final_awaitable::await_suspend(std::coroutine_handle<_promise_type<T>> self)noexcept {
-    auto &father_handle=self.promise()._parent_handle;
-    if (father_handle) {
-        auto *top_task_ptr=self.promise()._owner;
-        /*self是正在结束中的子协程，它有顶层task的指针*/
-        top_task_ptr->_in_active_handle=father_handle;//转移活动协程指向
-        top_task_ptr->_in_active_promise_ptr=self.promise()._parent_promise_ptr;
 
-        self.promise()._parent_promise_ptr->_owner=self.promise()._owner;//校准父协程的_owner,因为自己一定是准的（Task移动coro_repoint）
 
-        self.promise()._parent_promise_ptr->_state_code={1,true};
-        return father_handle;//不逗留，对称转移立刻resume父协程
-    }
-    self.promise()._state_code={0,true};
-    return std::noop_coroutine();
-}
 //定义顶层协程包装器
 template class Task<void>;
 using async=Task<void>;
@@ -501,13 +454,6 @@ async start(Task<T> root)noexcept
     co_await root;
 }
 //用这个包装任意协程桟可保证顶协程类型一致，这能让switch_to更安全地运行
-
-//补上suspend_state_code和switch_to的实现函数
-template<typename T>
-void suspend_state_code::await_suspend(std::coroutine_handle<_promise_type<T>> this_coroutine)const noexcept
-{
-    this_coroutine.promise()._state_code=_value;
-}
 //黑魔法类，直接获取顶部task指针
 class _get_top_task_ptr
 {
@@ -616,3 +562,6 @@ _swap_switch_to<Callable> swap_switch_to(Task<void> &&des,Callable&&hook)noexcep
 {
     return {&des,std::forward<Callable>(hook)};
 }
+
+
+//when_all 和 when_any接口，结构化并发的同步设施
