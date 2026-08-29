@@ -9,6 +9,8 @@
 #include<cassert>
 #include<memory>
 #include<atomic>
+#include<type_traits>
+#include<concepts>
 #ifndef NDEBUG
     #include<typeinfo>
 #endif
@@ -48,7 +50,22 @@ struct State_code_package
 };
 static constexpr inline State_code_package Kernel_State[]{{-1,true},{0,true},{1,true},{2,true},{3,true}};
 
-
+//用于结构化异步的完成令牌结构体
+template<typename T>
+struct Complete_token
+{
+    struct
+    {
+        T _value{};
+        bool _has_value{false};
+    }_value;
+    std::atomic<bool> _ready{false};
+};
+template<>
+struct Complete_token<void>
+{
+    std::atomic<bool> _ready{false};
+};
 
 struct final_awaitable//final_suspend返回的awaiter的作用是让子协程结束后直接跳转到父协程继续执行
 {
@@ -70,6 +87,8 @@ struct final_awaitable//final_suspend返回的awaiter的作用是让子协程结
             return father_handle;//不逗留，对称转移立刻resume父协程
         }
         self.promise()._state_code={0,true};
+        if(self.promise()._complete_flag.load(std::memory_order_acquire))
+            self.promise()._complete_flag.load(std::memory_order_relaxed)->_ready.store(true,std::memory_order_release);
         return std::noop_coroutine();
     }
     void await_resume()const noexcept{}//根本不会被调用
@@ -97,8 +116,7 @@ struct _base_promise
     {
         _exp=std::current_exception();
     }
-    //用于实现结构化并发的观察令牌机制
-    // std::shared_ptr<std::atomic_flag> _complete_flag{nullptr};
+
     _base_promise()noexcept
     {
         #ifndef NDEBUG
@@ -185,6 +203,7 @@ public:
         handle.destroy();
     }
     template<typename U>
+    requires (!std::is_same_v<U ,void>)
     std::expected<U,Promise_error> get_value()noexcept
     {
         if( _in_active_handle)
@@ -216,7 +235,7 @@ public:
         //依旧不可能获得2
         return true;
     }
-    //代表不可resume中的执行结束，（另一种不可恢复是无效Task）
+    //代表不可resume中的正常执行结束情况，（另一种情况不可恢复是无效Task）
     bool done()const noexcept
     {
         if(_in_active_handle)
@@ -241,7 +260,6 @@ public:
         }
         return true;
     }
-    // std::weak_ptr<std::atomic_flag> get_token()const noexcept;
 
     //接下来是awaitable成员
     //永远先触发父协程挂起，然后建立父子联系然后恢复子协程执行
@@ -292,6 +310,8 @@ static constexpr inline suspend_state_code co_exit{-1,true};
 
 
 
+
+//对Task和promise的特化只负责返回值相关的操作
 template<typename T>
 struct _promise_type:public _base_promise
 {
@@ -299,6 +319,11 @@ struct _promise_type:public _base_promise
         T _value{};
         bool _has_value{false};
     }_value;
+
+    //内部细节上，如果存在完成令牌的观察者，那么return的值会存入令牌指针里，这意味着直接Task::get_value会失效
+    //为了安全起见，有返回值的Task只能有一个观察者，此处用atomic来来支持shared_ptr的线程安全
+    mutable std::atomic<std::shared_ptr<Complete_token<T>>> _complete_flag{nullptr};
+
     Task<T> get_return_object()noexcept
     {
         return  std::coroutine_handle<_promise_type>::from_promise(*this);
@@ -309,7 +334,11 @@ struct _promise_type:public _base_promise
         type=&typeid(_promise_type);
         #endif
     }
-    ~_promise_type(){} 
+    ~_promise_type()
+    {
+        if(_complete_flag.load(std::memory_order_acquire))
+            _complete_flag.load(std::memory_order_relaxed)->_ready.store(true,std::memory_order_relaxed);
+    } 
 
     suspend_state_code yield_value(const T &value)noexcept(
         noexcept(T(value)) &&
@@ -334,6 +363,12 @@ struct _promise_type:public _base_promise
         noexcept(T(value))
     )
     {
+        if(_complete_flag.load(std::memory_order_acquire))
+        {
+            _complete_flag.load(std::memory_order_relaxed)->_value._has_value=true;
+            _complete_flag.load(std::memory_order_relaxed)->_value._value=value;
+            return;
+        }
         _value._has_value=true;
         _value._value=value;
     }
@@ -342,6 +377,12 @@ struct _promise_type:public _base_promise
         noexcept(T(std::move(value)))
     )
     {
+        if(_complete_flag.load(std::memory_order_acquire))
+        {
+            _complete_flag.load(std::memory_order_relaxed)->_value._has_value=true;
+            _complete_flag.load(std::memory_order_relaxed)->_value._value=std::move(value);
+            return;
+        }
         _value._has_value=true;
         _value._value=std::move(value);
     }
@@ -355,6 +396,7 @@ class Task:public _base_task
     template<typename U> friend class _promise_type; 
 public:
     using promise_type=_promise_type<T>;
+    auto get_value()noexcept{return _base_task::get_value<T>();}
     Task()noexcept:_base_task{}
     {
         #ifndef NDEBUG
@@ -385,7 +427,40 @@ public:
             return std::unexpected(Promise_error::NO_value);
         return std::move(static_cast<_promise_type<T>*>(_promise_ptr)->_value._value);
     }
-
+    std::shared_ptr<Complete_token<T>> get_token()const noexcept
+    //基本上除了get_token是线程安全的(不完全安全，比如协程正在运行时)，其他所有成员都不打算设置成线程安全
+    {
+        promise_type* ptr=static_cast<promise_type*>(_promise_ptr);
+        auto current_ptr=ptr->_complete_flag.load(std::memory_order_relaxed);
+        //说明已经有人观察了这个Task,那就直接放弃获取观察
+        if(current_ptr)
+            return nullptr;
+        std::shared_ptr<Complete_token<T>> shared(new (std::nothrow) Complete_token<T>);
+        if(!shared)
+            return nullptr;//内存分配失败那就算了，没招
+        //current_ptr=nullptr;已经是了
+        while(
+            !ptr->_complete_flag.compare_exchange_weak(current_ptr,shared,std::memory_order_release,std::memory_order_relaxed) &&
+            current_ptr==nullptr
+        );
+        if(current_ptr==nullptr)//是交换成功了，那就把这个shared交出去
+        {
+            //因为只有一个线程能抢到CAS,所以这条if不存在竞态（不存在多写竞态）
+            if(done()/*代表两条信息，1.协程结束了；2.协程帧还在。因此接下来能大胆去移动值*/)
+            {
+                if(ptr->_value._has_value)
+                {
+                    shared->_value._value=std::move(ptr->_value._value);
+                    ptr->_value._has_value=false;
+                    shared->_value._has_value=true;
+                }
+                shared->_ready.store(true,std::memory_order_release);
+                //最后的发布语义则保证了读端不会在数据写入之前尝试读取
+            }
+            return shared;
+        }
+        return nullptr;//那要是交换失败了，这个Task的观察权就不属于该线程了，只能返回nullptr
+    }
 };
 
 /*=========================然后做一下void特化=========================*/
@@ -404,6 +479,7 @@ public:
         type=&typeid(Task);
         #endif
     }
+    std::shared_ptr<Complete_token<void>> get_token()const noexcept;
     Task(std::coroutine_handle<promise_type> handle)noexcept;
     Task(Task&&other)noexcept=default;
     Task(const Task&)=delete;
@@ -423,6 +499,8 @@ public:
 template<>
 struct _promise_type<void>:public _base_promise
 {
+    mutable std::atomic<std::shared_ptr<Complete_token<void>>> _complete_flag{nullptr};
+
     Task<void> get_return_object()noexcept
     {
         return  std::coroutine_handle<_promise_type>::from_promise(*this);
@@ -433,7 +511,12 @@ struct _promise_type<void>:public _base_promise
         type=&typeid(_promise_type);
         #endif
     }
-    ~_promise_type(){}
+    ~_promise_type()
+    //析构非线程安全
+    {
+        if(_complete_flag.load(std::memory_order_acquire))
+            _complete_flag.load(std::memory_order_relaxed)->_ready.store(true,std::memory_order_relaxed);
+    }
 
     void return_void()const noexcept{}
 };
@@ -442,6 +525,25 @@ Task<void>::Task(std::coroutine_handle<promise_type> handle)noexcept:_base_task{
     #ifndef NDEBUG
     type=&typeid(Task);
     #endif
+}
+//无返回值Task因为没有复杂数据竞争，只有atomic判断，因而支持多观察者
+std::shared_ptr<Complete_token<void>> Task<void>::get_token()const noexcept
+{
+    promise_type *ptr=static_cast<promise_type*>(_promise_ptr);
+    auto current_ptr=ptr->_complete_flag.load(std::memory_order_relaxed);
+    if(current_ptr)
+        return current_ptr;
+    std::shared_ptr<Complete_token<void>> shared(new (std::nothrow)Complete_token<void>);
+    if(!shared)
+        return nullptr;
+    //current_ptr=nullptr
+    while(
+        !ptr->_complete_flag.compare_exchange_weak(current_ptr,shared,std::memory_order_release,std::memory_order_relaxed) &&
+        current_ptr==nullptr
+    );
+    if(current_ptr==nullptr)
+        return shared;
+    return current_ptr;
 }
 
 
@@ -534,6 +636,7 @@ public:
             _destination->_handle=nullptr;
             _destination->_in_active_handle=nullptr;
             _destination->_in_active_promise_ptr=nullptr;
+            _destination->_promise_ptr=nullptr;
             _handle.destroy();
             //虽然销毁帧，并不会影响await_suspend的执行，因为接下来不会再访问原协程的任何东西了
             //也不会再访问_swap_switch_to的任何成员，origin_task是该函数的局部变量
@@ -563,5 +666,99 @@ _swap_switch_to<Callable> swap_switch_to(Task<void> &&des,Callable&&hook)noexcep
     return {&des,std::forward<Callable>(hook)};
 }
 
-
 //when_all 和 when_any接口，结构化并发的同步设施
+//when_all和when_any的职责很简单：判断是否达成条件。至于如何调度句柄，不在该接口的功能范围内（在并发状态下安全取到Task里的值极其困难，且可能有违unique语义
+enum class When_error{
+    NOT_YET,//尚未结束的人物
+    INVALID_HANDLE,//不论是否完成，已经析构的Task都无法再获取到其返回值，此处生命周期不由库负责
+    VOID_TASK//async句柄，没有返回值
+};
+namespace detail
+{
+constexpr inline auto check_one_element=[]<typename T>(const std::shared_ptr<Complete_token<T>> element)->bool
+{
+    if(!element)
+        return true;
+    return element->_ready.load(std::memory_order_acquire);
+};
+constexpr inline auto get_one_result=[]<typename T>(const std::shared_ptr<Complete_token<T>> element)->std::expected<T,When_error>
+{
+    if constexpr(std::is_same_v<T,void>)
+        return std::unexpected(When_error::VOID_TASK);
+    else
+        {
+        if(!element)
+            return std::unexpected(When_error::INVALID_HANDLE);
+        if(element->_ready.load(std::memory_order_acquire))
+        {
+            element->_value._has_value=false;
+            return std::move(element->_value._value);
+        }
+        return std::unexpected(When_error::NOT_YET);
+    }
+};
+}
+template<typename ...Argt>
+struct When_all_readyable
+{
+    When_all_readyable(Task<Argt>& ...args)noexcept:
+        _tasks_waiting{std::make_tuple(args.get_token() ...)}
+    {}
+    bool ready()const noexcept
+    {
+        return check_tuple_and(detail::check_one_element,N);
+    }
+    auto get_result()const noexcept
+    {
+        return get_tuple_and(detail::get_one_result,N);
+    }
+    When_all_readyable(const When_all_readyable&)=delete;
+    When_all_readyable& operator=(const When_all_readyable&)=delete;
+    When_all_readyable(When_all_readyable&&)=delete;
+    When_all_readyable& operator=(When_all_readyable&&)=delete;
+private:
+    std::tuple<std::shared_ptr<Complete_token<Argt>> ...> _tasks_waiting;
+    static constexpr inline auto N=std::make_index_sequence<std::tuple_size_v<decltype(_tasks_waiting)>>{};
+    template<typename F,std::size_t ...Index>
+    bool check_tuple_and(F &&func,std::index_sequence<Index...>)const noexcept
+    {
+        return (func(std::get<Index>(_tasks_waiting)) && ...);
+    }
+    template<typename F,std::size_t ...Index>
+    auto get_tuple_and(F &&func,std::index_sequence<Index...>)const noexcept
+    {
+        return std::tuple_cat(std::make_tuple(func(std::get<Index>(_tasks_waiting))) ...);
+    }
+};
+template<typename ...Argt>
+struct When_any_readyable
+{
+    When_any_readyable(Task<Argt>& ...args)noexcept:
+        _tasks_waiting{std::make_tuple(args.get_token() ...)}
+    {}
+    bool ready()const noexcept
+    {
+        return check_tuple_or(detail::check_one_element,N);
+    }
+    auto get_result()const noexcept
+    {
+        return get_tuple_and(detail::get_one_result,N);
+    }
+    When_any_readyable(const When_any_readyable&)=delete;
+    When_any_readyable& operator=(const When_any_readyable&)=delete;
+    When_any_readyable(When_any_readyable&&)=delete;
+    When_any_readyable& operator=(When_any_readyable&&)=delete;
+private:
+    std::tuple<std::shared_ptr<Complete_token<Argt>> ...> _tasks_waiting;
+    static constexpr inline auto N=std::make_index_sequence<std::tuple_size_v<decltype(_tasks_waiting)>>{};
+    template<typename F,std::size_t ...Index>
+    bool check_tuple_or(F &&func,std::index_sequence<Index...>)const noexcept
+    {
+        return (func(std::get<Index>(_tasks_waiting)) || ...);
+    }
+    template<typename F,std::size_t ...Index>
+    auto get_tuple_and(F &&func,std::index_sequence<Index...>)const noexcept
+    {
+        return std::tuple_cat(std::make_tuple(func(std::get<Index>(_tasks_waiting))) ...);
+    }
+};
