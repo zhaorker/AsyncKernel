@@ -12,6 +12,7 @@
 #include<unordered_map>
 #include<deque>
 #include<vector>
+#include<memory>
 
 #include<utility>
 #include<optional>
@@ -57,30 +58,42 @@ class Channel
     friend class Free_thread_pool;
     friend class Dynamic_thread_pool;
 public:
-    Channel(Pool *owner)noexcept:_owner{owner},_pro_token{owner->_task_queue},_complete_queue{new (std::nothrow) moodycamel::ConcurrentQueue<Context>}{}
+    Channel(Pool *owner)noexcept:_owner{owner},_pro_token{owner->_task_queue},_SC_queue{}{}
     struct Context
     {
         std::uint64_t tid;
-        void *any_handle;
-        std::weak_ptr<moodycamel::ConcurrentQueue<Context>>destination;
+        void *any_handle{nullptr};
     };
     template<typename T>
-    std::optional<std::future<T>> commit_task(std::packaged_task<T()> &&task,Context &context)noexcept
+    std::optional<std::future<T>> commit_task(std::packaged_task<T()> &&task,const Context &context={0})noexcept
     {
-        if(!_complete_queue)
-            return std::nullopt;
         try{
             auto future=task.get_future();//thw only where maybe throw
-            context.destination=_complete_queue;
             std::move_only_function<void()> _start_func=std::move([task=std::move(task)]mutable{task();});
-            std::unique_ptr<Task_package> element(new(std::nothrow)Task_package(
+            std::shared_ptr<Task_package> element(new(std::nothrow)Task_package(
                 std::move(_start_func),
-                context
+                context,
+                false
             ));
             if(!element)
                 return std::nullopt;
-            if(_owner->_commit_task(&_pro_token,std::move(element)))
+            bool if_success;
+            if constexpr (std::is_same_v<Pool,Free_thread_pool>)
+            {
+                if_success=_owner->_commit_task(&_pro_token,element);
+            }else if constexpr(std::is_same_v<Pool,Dynamic_thread_pool>)
+            {
+                if_success=_owner->_commit_task(element);
+            }
+            if(if_success)
+            {
+                try{
+                    _SC_queue.push_back(std::move(element));
+                }catch(...){
+                    return std::nullopt;
+                }
                 return future;
+            }
             return std::nullopt;
         }catch(...){
             return std::nullopt;
@@ -88,13 +101,11 @@ public:
     }
     std::vector<Context> get_complete()
     {
-        if(!_complete_queue)
-            return {};
         std::vector<Context> result;
         result.reserve(256);
-        Context item;
-        while (_complete_queue->try_dequeue(item)) {
-            result.push_back(std::move(item));
+        while (!_SC_queue.empty() && _SC_queue.front()->_finish.load(std::memory_order_acquire)) {
+            result.push_back(std::move(_SC_queue.front()->_context_handle));
+            _SC_queue.pop_front();
         }
         return result;
     }
@@ -103,8 +114,9 @@ private:
     {
         std::move_only_function<void()> _start_func;
         Context _context_handle;
+        std::atomic<bool> _finish;
     };
-    std::shared_ptr<moodycamel::ConcurrentQueue<Context>> _complete_queue;
+    std::deque<std::shared_ptr<Task_package>> _SC_queue;
     Pool *_owner;
 
     using Pro_token=typename Token_type<Pool>::Type;
@@ -142,7 +154,7 @@ private:
     bool _valid;
 
     using Task_package=Channel<Free_thread_pool>::Task_package;
-    using Task_queue=moodycamel::ConcurrentQueue<std::unique_ptr<Task_package>>;
+    using Task_queue=moodycamel::ConcurrentQueue<std::weak_ptr<Task_package>>;
 
     Task_queue _task_queue;
     std::counting_semaphore<std::numeric_limits<int>::max()> _semaphore;
@@ -151,7 +163,7 @@ private:
     
     std::vector<std::jthread> _pool_threads;
 
-    bool _commit_task(moodycamel::ProducerToken *protoken,std::unique_ptr<Task_package> &&element)noexcept
+    bool _commit_task(moodycamel::ProducerToken *protoken,std::weak_ptr<Task_package> &&element)noexcept
     {
         unsigned current_size=_queue_size.load(std::memory_order_relaxed);
         if(current_size>_queue_waterline)
@@ -173,20 +185,20 @@ private:
         {
             if(!semaphore->try_acquire_for(std::chrono::milliseconds(10)))
                 continue;
-            std::unique_ptr<Task_package> element;
+            std::weak_ptr<Task_package> element;
             if(!task_queue->try_dequeue(contoken,element))
             {
                 continue;
             }
             queue_size->fetch_sub(1,std::memory_order_relaxed);
-            auto destination=element->_context_handle.destination.lock();
-            if(!destination)
+            auto shared=element.lock();
+            if(!shared)
             {
                 element.reset();
                 continue;
             }
-            element->_start_func();
-            destination->enqueue(element->_context_handle);
+            shared->_start_func();
+            shared->_finish.store(true,std::memory_order_release);
             element.reset();
         }
     }
@@ -261,7 +273,7 @@ public:
 
 private:
     using Task_package = Channel<Dynamic_thread_pool>::Task_package;
-    using Task_queue = std::deque<std::unique_ptr<Task_package>>;
+    using Task_queue = std::deque<std::weak_ptr<Task_package>>;
 
     const std::size_t _coro_threads;
     const std::size_t _max_threads;
@@ -280,8 +292,7 @@ private:
 
     bool _valid;
 
-    bool _commit_task([[maybe_unused]] Accept_any *unused,
-                      std::unique_ptr<Task_package> &&element)
+    bool _commit_task(std::weak_ptr<Task_package> &&element)
     {
         std::jthread::id exited_id;
         while (_thread_exited.try_dequeue(exited_id)) {
@@ -355,7 +366,7 @@ private:
         std::counting_semaphore<std::numeric_limits<int>::max()> *queue_blank)
     {
         moodycamel::ProducerToken protoken{*exit_thread};
-        std::unique_ptr<Task_package> element;
+        std::weak_ptr<Task_package> element;
 
         while (true) {
             std::unique_lock<std::mutex> guard{*queue_mutex};
@@ -389,14 +400,14 @@ private:
             queue_blank->release();
             guard.unlock();
 
-            auto destination=element->_context_handle.destination.lock();
-            if(!destination)
+            auto shared=element.lock();
+            if(!shared)
             {
                 element.reset();
                 continue;
             }
-            element->_start_func();
-            destination->enqueue(element->_context_handle);
+            shared->_start_func();
+            shared->_finish.store(true,std::memory_order_release);
             element.reset();
         }
     }
