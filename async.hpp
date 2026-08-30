@@ -87,8 +87,9 @@ struct final_awaitable//final_suspend返回的awaiter的作用是让子协程结
             return father_handle;//不逗留，对称转移立刻resume父协程
         }
         self.promise()._state_code={0,true};
-        if(self.promise()._complete_flag.load(std::memory_order_acquire))
-            self.promise()._complete_flag.load(std::memory_order_relaxed)->_ready.store(true,std::memory_order_release);
+        auto ptr=self.promise()._complete_flag.load(std::memory_order_acquire);
+        if(ptr)
+            ptr->_ready.store(true,std::memory_order_release);
         return std::noop_coroutine();
     }
     void await_resume()const noexcept{}//根本不会被调用
@@ -336,8 +337,9 @@ struct _promise_type:public _base_promise
     }
     ~_promise_type()
     {
-        if(_complete_flag.load(std::memory_order_acquire))
-            _complete_flag.load(std::memory_order_relaxed)->_ready.store(true,std::memory_order_relaxed);
+        auto ptr=_complete_flag.load(std::memory_order_acquire);
+        if(ptr)
+            ptr->_ready.store(true,std::memory_order_relaxed);
     } 
 
     suspend_state_code yield_value(const T &value)noexcept(
@@ -363,10 +365,11 @@ struct _promise_type:public _base_promise
         noexcept(T(value))
     )
     {
-        if(_complete_flag.load(std::memory_order_acquire))
+        auto ptr=_complete_flag.load(std::memory_order_acquire);
+        if(ptr)
         {
-            _complete_flag.load(std::memory_order_relaxed)->_value._has_value=true;
-            _complete_flag.load(std::memory_order_relaxed)->_value._value=value;
+            ptr->_value._has_value=true;
+            ptr->_value._value=value;
             return;
         }
         _value._has_value=true;
@@ -377,10 +380,11 @@ struct _promise_type:public _base_promise
         noexcept(T(std::move(value)))
     )
     {
-        if(_complete_flag.load(std::memory_order_acquire))
+        auto ptr=_complete_flag.load(std::memory_order_acquire);
+        if(ptr)
         {
-            _complete_flag.load(std::memory_order_relaxed)->_value._has_value=true;
-            _complete_flag.load(std::memory_order_relaxed)->_value._value=std::move(value);
+            ptr->_value._has_value=true;
+            ptr->_value._value=std::move(value);
             return;
         }
         _value._has_value=true;
@@ -479,6 +483,7 @@ public:
         type=&typeid(Task);
         #endif
     }
+    //这两个不得不延迟实现
     std::shared_ptr<Complete_token<void>> get_token()const noexcept;
     Task(std::coroutine_handle<promise_type> handle)noexcept;
     Task(Task&&other)noexcept=default;
@@ -514,8 +519,9 @@ struct _promise_type<void>:public _base_promise
     ~_promise_type()
     //析构非线程安全
     {
-        if(_complete_flag.load(std::memory_order_acquire))
-            _complete_flag.load(std::memory_order_relaxed)->_ready.store(true,std::memory_order_relaxed);
+        auto ptr=_complete_flag.load(std::memory_order_acquire);
+        if(ptr)
+            ptr->_ready.store(true,std::memory_order_relaxed);
     }
 
     void return_void()const noexcept{}
