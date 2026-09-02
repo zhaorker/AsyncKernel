@@ -1,3 +1,10 @@
+/**
+ * @file threadpool.hpp.hpp
+ * @brief AsyncKernel 协程框架附带线程池头文件。
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Kevin
+ */
+
 #pragma once 
 
 #include<thread>
@@ -24,46 +31,34 @@
 
 #include"third_party/concurrentqueue/concurrentqueue.h"
 
-class lock_free_mutex
-{
-public:
-    void lock()noexcept
-    {
-        while(flag.test_and_set(std::memory_order_acquire))std::this_thread::yield();
-    }
-    void unlock()noexcept{flag.clear(std::memory_order_release);}
-private:
-    std::atomic_flag flag{};
-};
 
 class Free_thread_pool;
 class Dynamic_thread_pool;
 
-struct Accept_any
-{
-    template<typename ...T>
-    Accept_any(T&& ...v)noexcept{}
-};
-
-template<typename Of_what>
-struct Token_type{using Type = void;};
-template<>
-struct Token_type<Free_thread_pool>{using Type=moodycamel::ProducerToken;};
-template<>
-struct Token_type<Dynamic_thread_pool>{using Type=Accept_any;};
-
+/**
+ *@brief 通用channel类，用于向线程池提交任务并获取完成通知
+ *@tparam Poll指这是哪类线程池的Channel
+ *@warning Channel本身非线程安全，不要跨线程使用Channel
+ */
 template<class Pool>
 class Channel
 {
     friend class Free_thread_pool;
     friend class Dynamic_thread_pool;
+    Channel(Pool *owner)noexcept:_owner{owner},_SC_queue{}{}
 public:
-    Channel(Pool *owner)noexcept:_owner{owner},_pro_token{owner->_task_queue},_SC_queue{}{}
     struct Context
     {
         std::uint64_t tid;
         void *any_handle{nullptr};
     };
+    /**
+     *@brief 提交一个任务
+     *@param 一个包装任务的packaged_task,和一个任务上下文
+     *@tparam 提交的任务的返回值T
+     *@return std::optional<std::future<T>>
+     *@note 若因某些原因提交任务失败，会返回nullopt
+     */
     template<typename T>
     std::optional<std::future<T>> commit_task(std::packaged_task<T()> &&task,const Context &context={0})noexcept
     {
@@ -77,15 +72,7 @@ public:
             ));
             if(!element)
                 return std::nullopt;
-            bool if_success;
-            if constexpr (std::is_same_v<Pool,Free_thread_pool>)
-            {
-                if_success=_owner->_commit_task(&_pro_token,element);
-            }else if constexpr(std::is_same_v<Pool,Dynamic_thread_pool>)
-            {
-                if_success=_owner->_commit_task(element);
-            }
-            if(if_success)
+            if(_owner->_commit_task(element))
             {
                 try{
                     _SC_queue.push_back(std::move(element));
@@ -99,15 +86,39 @@ public:
             return std::nullopt;
         }
     }
+    /**
+     *@brief 获取已完成的任务的上下文
+     *@return 所有已完成的任务的上下文的vector
+     */
     std::vector<Context> get_complete()
     {
         std::vector<Context> result;
         result.reserve(256);
         while (!_SC_queue.empty() && _SC_queue.front()->_finish.load(std::memory_order_acquire)) {
-            result.push_back(std::move(_SC_queue.front()->_context_handle));
+            try{
+                result.push_back(std::move(_SC_queue.front()->_context_handle));
+            }catch(...)
+            {
+                return result;
+            }
             _SC_queue.pop_front();
         }
         return result;
+    }
+    /**
+     *@brief 取消任务
+     *@param uint64_t tid
+     *取消所有上下文任务号为tid的任务
+     */
+    void give_up_tid(std::uint64_t tid)
+    {
+        std::erase_if(_SC_queue,[&](std::shared_ptr<Task_package> &element)noexcept{return element->_context_handle.tid==tid;});
+    }
+    /**
+     *@brief 取消所有任务 */
+    void give_up_all()
+    {
+        _SC_queue.clear();
     }
 private:
     struct Task_package
@@ -118,15 +129,20 @@ private:
     };
     std::deque<std::shared_ptr<Task_package>> _SC_queue;
     Pool *_owner;
-
-    using Pro_token=typename Token_type<Pool>::Type;
-    Pro_token _pro_token;
 };
 
+/**
+ *@brief 无锁线程池
+ *内部用无锁队列储存任务，池线程数不动，适合纯计算类任务 */
 class Free_thread_pool
 {
     friend class Channel<Free_thread_pool>;
 public:
+    /**
+     *@brief 无锁线程池的构造函数
+     *@param threads_count要开的线程数和queue_waterline任务队列的最大水位
+     *@note 内部对queue_waterline使用模糊判断，即任务队列长度可能会偶尔超过水位线
+     */
     Free_thread_pool(unsigned threads_count,unsigned queue_waterline):
         _task_queue{1024},
         _semaphore{0},
@@ -148,6 +164,10 @@ public:
         _valid=true;
     }
     bool valid()const noexcept{return _valid;}
+    /**
+     *@brief 该函数获取该线程池对应的Channel
+     *@return Channel<Free_thread_pool>
+     */
     Channel<Free_thread_pool> get_channel()noexcept{return this;}
     using Context=Channel<Free_thread_pool>::Context;
 private:
@@ -163,12 +183,12 @@ private:
     
     std::vector<std::jthread> _pool_threads;
 
-    bool _commit_task(moodycamel::ProducerToken *protoken,std::weak_ptr<Task_package> &&element)noexcept
+    bool _commit_task(std::weak_ptr<Task_package> &&element)noexcept
     {
         unsigned current_size=_queue_size.load(std::memory_order_relaxed);
         if(current_size>_queue_waterline)
             return false;
-        if(!_task_queue.enqueue(*protoken,std::move(element)))
+        if(!_task_queue.enqueue(std::move(element)))
             return false;
         _queue_size.fetch_add(1,std::memory_order_relaxed);
         _semaphore.release();
@@ -204,13 +224,26 @@ private:
     }
 };
 
+/**
+ @brief 有锁动态线程池
+ *用互斥锁实现并发，支持复杂的线程池扩容策略，更多用于io
+ */
 class Dynamic_thread_pool
 {
     friend class Channel<Dynamic_thread_pool>;
 public:
     using Context = Channel<Dynamic_thread_pool>::Context;
+    /**
+     *@brief 有锁线程池提交任务时队列满的策略
+     *Discard即忽略任务，Channel::commit_task会返回nullopt
+     *Blocking即阻塞直到队列留出空位，该选项让提交任务一定成功
+     */
     enum class Overflow_strategy { Discard, Blocking };
 
+    /**
+     *@brief 动态线程池构造函数
+     *@param 核心线程数，最大线程数，队列上限，触发开新线程的队列水位线，任务队列满时的策略，临时线程销毁的空闲超时
+     */
     Dynamic_thread_pool(
         std::size_t coro_size,
         std::size_t max_size,
