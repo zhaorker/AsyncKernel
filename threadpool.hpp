@@ -2,7 +2,7 @@
  * @file threadpool.hpp.hpp
  * @brief AsyncKernel 协程框架附带线程池头文件。
  * SPDX-License-Identifier: GPL-3.0-or-later
- * SPDX-FileCopyrightText: Copyright (c) 2026 Kevin
+ * SPDX-FileCopyrightText: Copyright (c) 2026 zhaorker kevin081006@outlook.com
  */
 
 #pragma once 
@@ -59,12 +59,15 @@ public:
      *@return std::optional<std::future<T>>
      *@note 若因某些原因提交任务失败，会返回nullopt
      */
-    template<typename T>
-    std::optional<std::future<T>> commit_task(std::packaged_task<T()> &&task,const Context &context={0})noexcept
+    template<typename T,typename ... Argt>
+    std::optional<std::future<T>> commit_task(const Context &context,
+            std::packaged_task<T(Argt...)> &&task,Argt &&...argv)noexcept
     {
         try{
-            auto future=task.get_future();//thw only where maybe throw
-            std::move_only_function<void()> _start_func=std::move([task=std::move(task)]mutable{task();});
+            auto future=task.get_future();//the where maybe throw
+            std::move_only_function<void()> _start_func=std::move(
+                [task=std::move(task),...args=std::forward<Argt>(argv)]mutable{task(args...);}
+            );
             std::shared_ptr<Task_package> element(new(std::nothrow)Task_package(
                 std::move(_start_func),
                 context,

@@ -2,7 +2,7 @@
  * @file async.hpp
  * @brief AsyncKernel 协程框架核心头文件。
  * SPDX-License-Identifier: GPL-3.0-or-later
- * SPDX-FileCopyrightText: Copyright (c) 2026 Kevin
+ * SPDX-FileCopyrightText: Copyright (c) 2026 zhaorker kevin081006@outlook.com
  */
 
 #pragma once
