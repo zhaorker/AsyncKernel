@@ -5,7 +5,7 @@
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue)](https://en.cppreference.com/w/cpp/23)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)]()
 
-这是一个基于C++20协程的**高性能异步内核引擎**，旨在提供更简便且符合直觉的异步编程体验，并提升运行效率。  
+这是一个基于C++20协程的**高性能异步内核原语**，旨在提供更简便且符合直觉的异步编程体验，并提升运行效率。  
 
 ## 为什么选择 AsyncKernel？
 
@@ -24,7 +24,7 @@ AsyncKernel 的目标是：**提供协程执行流控制的最小原语，把控
    - 丢到自己的线程池里并发驱动。
    - 用 `co_await` 自由嵌套，用 `co_yield` 向外传递状态。
    - 用 `swap_switch_to` 实现协程间的对称转移（执行权交换）。
-   ———— **框架不替你决策，你拥有全部控制权。**
+   ———— **AsyncKernel不替你决策，你拥有全部控制权。**
 
 2. **单一职责（Unix 哲学）**  
    AsyncKernel **只做好一件事**：管理协程的执行流和生命周期。它不提供：
@@ -54,11 +54,11 @@ AsyncKernel 的目标是：**提供协程执行流控制的最小原语，把控
 
 5. **零开销抽象（Zero-overhead）**  
    - 不使用虚函数（无 vtable 开销）。
-   - 在 `NDEBUG` 模式下完全剥离 RTTI（通过 `#ifndef NDEBUG` 控制）。
+   - 在 `NDEBUG` 模式下完全剥离 RTTI。
    - 协程帧内存布局紧凑，状态传递通过平凡结构体完成（无动态分配）。
    - 对称转移（`final_awaitable`）避免了嵌套协程的逐层返回开销，性能接近手写的状态机。
 
-   你可以用 AsyncKernel 构建 **硬实时系统** 或 **高性能服务器**，而不必担心框架引入的额外开销。
+   你可以用 AsyncKernel 构建 **硬实时系统** 或 **高性能服务器**，而不必担心引入的额外开销。
 
 ### 与其他方案的对比
 
@@ -79,7 +79,6 @@ AsyncKernel 是 **“最小可行协程抽象层”**——它给你足够多的
 - ✅ 轻量状态码传递（`suspend_state_code` / `co_exit`）
 - ✅ 结构化并发（`When_all_readyable` / `When_any_readyable`）
 - ✅ 两种线程池（无锁固定线程池 + 有锁动态线程池）
-- ✅ 零虚函数，零 RTTI（NDEBUG 下），紧凑内存布局
 
 ---
 
@@ -234,13 +233,13 @@ int main() {
     return 0;
 }
 ```
-### 设计注记：为什么示例中用 poll 轮询而不是 epoll？
+### 设计注记：为什么示例中用非阻塞io轮询而不是 epoll？
 
 如果你注意到这个示例中有大量的空 resume，说明你对效率很敏感——这正是我们想要传达的。
 
 **AsyncKernel 故意不做调度器。** 这个示例用非阻塞io只是为了展示协程如何与底层 I/O 原语配合。你可以轻松地：
 - 把轮询换成 `epoll` / `kqueue` / `io_uring`。
-- 把 `std::suspend_always{}` 换成协程注册到全局事件循环（然后在事件触发时 `resume()`）。
+- 把 `std::suspend_always{}` 换成协程注册到全局事件循环（通过suspend_state_code通知外部，然后在事件触发时 `resume()`）。
 
 **调度策略是你的业务逻辑的一部分**，不是库的职责。用 AsyncKernel 你可以在 100 行内实现自己的 epoll 驱动调度器。
 
