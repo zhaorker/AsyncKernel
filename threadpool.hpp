@@ -61,12 +61,15 @@ public:
      */
     template<typename T,typename ... Argt>
     std::optional<std::future<T>> commit_task(const Context &context,
-            std::packaged_task<T(Argt&&...)> &&task,Argt &&...argv)noexcept
+            std::packaged_task<T(Argt&...)> &&task,Argt &...argv)noexcept
+    //关于为什么所有参数必须全是引用，如果用万能引用，就没有办法安全捕获进lambda——引用会decay掉，地址变了。因此不得不改成全引用参数 
     {
         try{
             auto future=task.get_future();//the where maybe throw
             std::move_only_function<void()> _start_func=std::move(
-                [task=std::move(task),...args=std::forward<Argt>(argv)]mutable{task(std::forward<Argt>(args)...);}
+                [task=std::move(task),&argv...]mutable{
+                    task(argv...);
+                }
             );
             std::shared_ptr<Task_package> element(new(std::nothrow)Task_package(
                 std::move(_start_func),
